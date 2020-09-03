@@ -14,6 +14,8 @@ typedef enum {
 #define CHECK_CODE "gaoding"//check code. this should change with the CHECK_CODE_LEN
 #define CHECK_CODE_LEN (7)
 #define AES_PLAINTEXT_LEN (16)//don't change
+#define ENCRYPT_FLAG "#%$@^&@#"
+#define ENCRYPT_FLAG_LEN (9)
 
 
 static void getSpecificationKey(AES_CYPHER_T mode, uint8_t *key, uint8_t *skey)
@@ -109,9 +111,11 @@ static int _aes_decrypt_cbc(AES_CYPHER_T mode, uint8_t *data, int64_t len, uint8
 		return len - nLast;
 	}
 }
-
+//-----------------------------------------------------------------------------
 static int64_t interface_cryption(AES_CRYPT_TYPE type, uint8_t *inData, int64_t inLen, uint8_t *key, uint8_t **outData)
 {
+	int IS_ENCRYPT_FLAG = 0;
+
 	uint8_t skey[33] = { 0 };
 	getSpecificationKey(AES_CYPHER_256, key, skey);
 
@@ -119,35 +123,63 @@ static int64_t interface_cryption(AES_CRYPT_TYPE type, uint8_t *inData, int64_t 
 	uint8_t *buffer = (uint8_t*)malloc(newLen * sizeof(char));
 	memset(buffer, 0, newLen * sizeof(char));
 	memcpy(buffer, inData, inLen);
-	
-	int64_t retLen = 0;
-	if (type == ENCRYPT)
+
+	//judge whether it is an encrypted data
+	char encrtpt_flag[ENCRYPT_FLAG_LEN + 1] = { 0 };
+	memcpy(encrtpt_flag, buffer, ENCRYPT_FLAG_LEN);
+	if (0 == strcmp(encrtpt_flag, ENCRYPT_FLAG))
 	{
-		//add check code
+		IS_ENCRYPT_FLAG = 1;
+	}
+	else
+	{
+		IS_ENCRYPT_FLAG = 0;
+	}
+
+	int64_t retLen = 0;
+	if (type == ENCRYPT && IS_ENCRYPT_FLAG == 0)
+	{
+		//add check code at the end
 		memcpy(buffer + inLen, CHECK_CODE, CHECK_CODE_LEN);
 
-		retLen = _aes_encrypt_cbc(AES_CYPHER_256, buffer, inLen + CHECK_CODE_LEN, skey, (uint8_t*)IV);//encrypt
+		//encrypt data
+		retLen = _aes_encrypt_cbc(AES_CYPHER_256, buffer, inLen + CHECK_CODE_LEN, skey, (uint8_t*)IV);
 		if (retLen > 0)
 		{
-			*outData = (uint8_t*)malloc((retLen + 1) * sizeof(char));
-			memcpy(*outData, buffer, retLen);
-			*(*outData + retLen) = '\0';
+			uint8_t *outBuffer = (uint8_t*)malloc((retLen + ENCRYPT_FLAG_LEN + 1) * sizeof(char));
+			//add encryption flag first
+			memcpy(outBuffer, ENCRYPT_FLAG, ENCRYPT_FLAG_LEN);
+			//add encrypted data
+			memcpy(outBuffer + ENCRYPT_FLAG_LEN, buffer, retLen);
+			outBuffer[ENCRYPT_FLAG_LEN + retLen] = '\0';
+
+			*outData = outBuffer;
+			retLen += ENCRYPT_FLAG_LEN;
 		}
 	}
-	else if (type == DECRYPT)
+	else if (type == DECRYPT && IS_ENCRYPT_FLAG == 1)
 	{
-		retLen = _aes_decrypt_cbc(AES_CYPHER_256, buffer, inLen, skey, (uint8_t*)IV);//decrypt
+		//encrypted ENCRYPT_FLAG for identification
+		uint8_t *pbegin = buffer + ENCRYPT_FLAG_LEN;
+		int64_t actualLen = inLen - ENCRYPT_FLAG_LEN;
+
+		//decrypt data
+		retLen = _aes_decrypt_cbc(AES_CYPHER_256, pbegin, actualLen, skey, (uint8_t*)IV);
 		if (retLen > 0)
 		{
+			//is the check value correct
 			char check_buffer[CHECK_CODE_LEN + 1] = { 0 };
-			memcpy(check_buffer, buffer + retLen - CHECK_CODE_LEN, CHECK_CODE_LEN);
+			memcpy(check_buffer, pbegin + retLen - CHECK_CODE_LEN, CHECK_CODE_LEN);
 			if (0 == strcmp(CHECK_CODE, check_buffer))
-			{	
+			{
 				//remove check code, and assignment to outData
-				*outData = (uint8_t*)malloc((retLen - CHECK_CODE_LEN + 1) * sizeof(char));
-				memcpy(*outData, buffer, retLen - CHECK_CODE_LEN);
-				*(*outData + retLen - CHECK_CODE_LEN) = '\0';
-				retLen -= CHECK_CODE_LEN;
+				actualLen = retLen - CHECK_CODE_LEN;
+				uint8_t *outBuffer = (uint8_t*)malloc((actualLen + 1) * sizeof(char));
+				memcpy(outBuffer, pbegin, actualLen);
+				outBuffer[actualLen] = '\0';
+
+				*outData = outBuffer;
+				retLen = actualLen;
 			}
 			else
 			{
@@ -216,6 +248,56 @@ static bool interface_cryption_file(AES_CRYPT_TYPE type, const char *inPath, con
 
 	return true;
 }
+//-------------------------------------------------------------------
+static bool interface_encrypt_memory_to_file(int type, uint8_t *inData, int64_t inLen, uint8_t *key, const char *outPath)
+{
+	uint8_t *outData = nullptr;
+	int64_t outLen;
+
+	outLen = interface_cryption(ENCRYPT, inData, inLen, key, &outData);
+	if (outLen <= 0)
+		return false;
+
+	FILE *File = nullptr;
+	File = fopen(outPath, "wb");
+	if (File == NULL)
+		return false;
+
+	fwrite(outData, 1, outLen, File);
+	fclose(File);
+
+	return true;
+}
+
+static bool interface_decrypt_file_to_memory(int type, const char *inPath, uint8_t *key, uint8_t **outData, int64_t *outLen)
+{
+	FILE *File = nullptr;
+	uint8_t *inBuffer = nullptr;
+	int64_t filesize;
+
+	if ((File = fopen(inPath, "rb")) == NULL)
+		return false;
+
+	fseek(File, 0, SEEK_END);
+	filesize = ftell(File);
+	inBuffer = (uint8_t*)malloc(filesize + 1);
+	memset(inBuffer, 0, (filesize + 1) * sizeof(char));
+	fseek(File, 0, SEEK_SET);
+	fread(inBuffer, 1, filesize, File);
+	fclose(File);
+
+	*outLen = interface_cryption(DECRYPT, inBuffer, filesize, key, outData);
+	if (*outLen <= 0)
+	{
+		*outLen = 0;
+		if(*outData)
+			free(*outData);
+		*outData = nullptr;
+	}
+
+
+	return true;
+}
 
 //-----------------------------class Cryption------------------------
 Cryption::Cryption()
@@ -255,43 +337,12 @@ int Cryption::decrypt_file(int type, const char *inPath, const char *outPath, co
 //memory - file
 int Cryption::encrypt_memory_to_file(int type, uint8_t *inData, int64_t inLen, uint8_t *key, const char *outPath)
 {
-	uint8_t *outData = nullptr;
-	int64_t outLen;
-
-	outLen = interface_cryption(ENCRYPT, inData, inLen, key, &outData);
-	if (outLen <= 0)
-		return 0;
-
-	FILE *File = nullptr;
-	File = fopen(outPath, "wb");
-	if (File == NULL)
-		return 0;
-
-	fwrite(outData, 1, outLen, File);
-	fclose(File);
-
-	return 1;
+	bool ret = interface_encrypt_memory_to_file(type, inData, inLen, key, outPath);
+	return (ret) ? 1 : 0;
 }
 
 int Cryption::decrypt_file_to_memory(int type, const char *inPath, uint8_t *key, uint8_t **outData, int64_t *outLen)
 {
-	FILE *File = nullptr;
-	uint8_t *inBuffer = nullptr;
-	int64_t filesize;
-
-	if ((File = fopen(inPath, "rb")) == NULL)
-		return 0;
-
-	fseek(File, 0, SEEK_END);
-	filesize = ftell(File);
-	inBuffer = (uint8_t*)malloc(filesize + 1);
-	memset(inBuffer, 0, (filesize + 1) * sizeof(char));
-	fseek(File, 0, SEEK_SET);
-	fread(inBuffer, 1, filesize, File);
-	fclose(File);
-
-	Cryption decrypt;
-	decrypt.decrypt(ENCRYPT, inBuffer, filesize, NULL, outData, outLen);
-
-	return 1;
+	bool ret = interface_decrypt_file_to_memory(type, inPath, key, outData, outLen);
+	return (ret) ? 1 : 0;
 }
